@@ -20,10 +20,14 @@ CURR_DIR = os.path.dirname(os.path.abspath(__file__))
 NDX_CSV = os.path.join(os.path.dirname(CURR_DIR), "nasdaq", "data", "NDX.csv")
 
 
-def make_sample(source: str = NDX_CSV, seed: int = 0) -> pd.DataFrame:
+def make_sample(source: str = NDX_CSV, seed: int = 0, with_extra: bool = False) -> pd.DataFrame:
     """
     Return a DataFrame with the three columns of the expected input layout:
     `날짜`, `종가`, `무위험금리` (the latter annualized, in percent).
+
+    With `with_extra`, a fourth column `변동성지수` is added to illustrate the custom
+    variable options: the trailing 20-day realized volatility of the index, annualized and
+    in percent. It only uses past returns, so it can be fed to the model as is.
     """
     df = pd.read_csv(source)[["date", "close"]].dropna()
     rng = np.random.default_rng(seed)
@@ -31,7 +35,11 @@ def make_sample(source: str = NDX_CSV, seed: int = 0) -> pd.DataFrame:
     steps = rng.normal(0., .02, len(df))
     rf = pd.Series(steps, index=df.index).cumsum() * .5 + 3.
     rf = rf.clip(.1, 6.).round(3)
-    return pd.DataFrame({"날짜": df.date, "종가": df.close.round(4), "무위험금리": rf})
+    out = pd.DataFrame({"날짜": df.date, "종가": df.close.round(4), "무위험금리": rf})
+    if with_extra:
+        realized_vol = df.close.pct_change().rolling(20).std() * np.sqrt(252) * 100.
+        out["변동성지수"] = realized_vol.bfill().round(3)
+    return out
 
 
 def main(argv=None) -> int:
@@ -40,9 +48,11 @@ def main(argv=None) -> int:
     parser.add_argument("--output", default=os.path.join(CURR_DIR, "sample_input.csv"),
                         help="저장할 파일 경로 (.csv 또는 .xlsx)")
     parser.add_argument("--seed", type=int, default=0, help="합성 무위험금리 난수 시드")
+    parser.add_argument("--with-extra", action="store_true",
+                        help="커스텀 변수 예시로 '변동성지수'(20일 실현변동성) 열을 추가")
     args = parser.parse_args(argv)
 
-    sample = make_sample(args.source, seed=args.seed)
+    sample = make_sample(args.source, seed=args.seed, with_extra=args.with_extra)
     if args.output.lower().endswith((".xlsx", ".xls")):
         sample.to_excel(args.output, index=False)
     else:
