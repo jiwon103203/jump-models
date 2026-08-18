@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from backtest import build_weights, delay_robustness_table, run_0_1_strategy
 from features import apply_transform, build_extra_features, parse_extra_spec
 from hmm_benchmark import smooth_states
-from rolling import refit_schedule, semiannual_anchors
+from rolling import (init_model, refit_schedule, resolve_max_feats, run_rolling_jm,
+                     semiannual_anchors)
 
 DATES = pd.date_range("2020-01-01", periods=12, freq="D").date
 LEVELS = pd.Series([10., 11, 12, 11, 10, 9, 10, 11, 12, 13, 12, 11], index=DATES, name="x")
@@ -100,6 +101,82 @@ def test_refit_schedule():
     assert all(date.month in (1, 7) and date.day <= 4 for date in anchors)
     schedule = refit_schedule(index, window=3000, min_window=500)
     assert all(pos >= 500 and win == min(3000, pos) for _, pos, win in schedule)
+
+
+def test_resolve_max_feats():
+    """`max_feats` defaults to half the features, is capped at the feature count, and is >= 1."""
+    assert resolve_max_feats(None, 10) == 5.
+    assert resolve_max_feats(None, 3) == 2.       # never below two features
+    assert resolve_max_feats(3., 10) == 3.
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        assert resolve_max_feats(20., 10) == 10.  # capped at the feature count
+    try:
+        resolve_max_feats(0.5, 10)
+        raise AssertionError("max_feats < 1은 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+
+def test_init_model():
+    """The factory returns the discrete jump model or the sparse one, and rejects anything else."""
+    from jumpmodels.jump import JumpModel
+    from jumpmodels.sparse_jump import SparseJumpModel
+    assert isinstance(init_model("jm", jump_penalty=50.), JumpModel)
+    sjm = init_model("sjm", jump_penalty=50., n_init=4, max_feats=3., n_features=9)
+    assert isinstance(sjm, SparseJumpModel)
+    assert sjm.max_feats == 3. and sjm.n_init_jm == 4
+    try:
+        init_model("cjm")
+        raise AssertionError("알 수 없는 모델은 ValueError를 내야 합니다.")
+    except ValueError:
+        pass
+
+
+def _toy_features(n=900, seed=0):
+    """A two-regime toy series with one informative feature pair and two pure noise columns."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2015-01-01", periods=n).date
+    # alternate bull and bear blocks, so that every training window covers both regimes
+    state = np.tile(np.repeat([0, 1], 90), n // 180 + 1)[:n]
+    ret = pd.Series(rng.normal(np.where(state == 0, .001, -.001),
+                               np.where(state == 0, .006, .02)), index=dates)
+    X = pd.DataFrame({
+        "ret_20": ret.ewm(halflife=20).mean(),
+        "DD_10": np.sqrt(np.minimum(ret, 0.).pow(2).ewm(halflife=10).mean()),
+        "noise_a": pd.Series(rng.normal(size=n), index=dates),
+        "noise_b": pd.Series(rng.normal(size=n), index=dates),
+    }).iloc[60:]
+    return X, ret.reindex(X.index)
+
+
+def test_sparse_jump_model_run():
+    """The sparse model runs end to end and down-weights the noise features."""
+    X, ret = _toy_features()
+    result = run_rolling_jm(X, ret, model="sjm", jump_penalty=10., window=300, min_window=250,
+                            n_init=2, verbose=False)
+    assert result.model == "sjm"
+    assert result.feat_weights is not None
+    assert list(result.feat_weights.columns) == list(X.columns)
+    assert len(result.feat_weights) == len(result.schedule)
+    assert (result.feat_weights.to_numpy() >= 0).all()
+    informative = result.feat_weights[["ret_20", "DD_10"]].mean().mean()
+    noise = result.feat_weights[["noise_a", "noise_b"]].mean().mean()
+    assert informative > .5 > noise, (informative, noise)      # the noise columns are dropped
+    # centroids are reported for every feature, in the original units
+    assert all(f"center_{col}" in result.params.columns for col in X.columns)
+    assert result.params.stay_prob.between(0., 1.).all()
+    assert result.params.freq.gt(0.).all()      # both regimes present in every window
+
+
+def test_jump_model_run_has_no_feature_weights():
+    """The discrete model produces the same shape of output, without feature weights."""
+    X, ret = _toy_features()
+    result = run_rolling_jm(X, ret, model="jm", jump_penalty=10., window=300, min_window=250,
+                            n_init=2, verbose=False)
+    assert result.model == "jm" and result.feat_weights is None
+    assert set(result.regimes.regime.unique()) <= {0, 1}
 
 
 def main() -> int:
